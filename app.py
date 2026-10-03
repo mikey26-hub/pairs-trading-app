@@ -19,10 +19,11 @@ state = {
 
 cache = {
     "last_fetch": 0,
-    "z_score": "0.00",
+    "z_score": "Loading...",
     "xom": "0.00",
     "cvx": "0.00",
-    "status": "OK"
+    "status": "OK",
+    "mode": "LIVE"
 }
 
 HTML_TEMPLATE = """
@@ -128,33 +129,35 @@ HTML_TEMPLATE = """
 </html>
 """
 
+def fetch_live_data():
+    """Immediately updates cache with live historical closed bars if market is offline."""
+    try:
+        data = yf.download(tickers="XOM CVX", period="1mo", interval="1d", progress=False)
+        closes = data['Close'] if 'Close' in data else data
+        df = closes[['XOM', 'CVX']].dropna()
+
+        if not df.empty:
+            X = sm.add_constant(df['CVX'])
+            model = sm.OLS(df['XOM'], X).fit()
+            beta = model.params['CVX']
+            alpha = model.params['const']
+            
+            spread = df['XOM'] - (beta * df['CVX']) - alpha
+            z = (spread - spread.mean()) / spread.std()
+            
+            cache["z_score"] = f"{float(z.iloc[-1]):.3f}"
+            cache["xom"] = f"{float(df['XOM'].iloc[-1]):.2f}"
+            cache["cvx"] = f"{float(df['CVX'].iloc[-1]):.2f}"
+            cache["status"] = "OK"
+            cache["last_fetch"] = time.time()
+    except Exception as e:
+        cache["status"] = "ERROR"
+
 def update_market_cache():
     while True:
-        # Only fetch live data if reset or not currently forced
-        if time.time() - cache["last_fetch"] >= 30 and cache.get("mode") != "FORCED":
-            try:
-                data = yf.download(tickers="XOM CVX", period="5d", interval="1h", progress=False)
-                closes = data['Close'] if 'Close' in data else data
-                df = closes[['XOM', 'CVX']].dropna()
-
-                if not df.empty:
-                    X = sm.add_constant(df['CVX'])
-                    model = sm.OLS(df['XOM'], X).fit()
-                    beta = model.params['CVX']
-                    alpha = model.params['const']
-                    
-                    spread = df['XOM'] - (beta * df['CVX']) - alpha
-                    z = (spread - spread.mean()) / spread.std()
-                    
-                    cache["z_score"] = f"{float(z.iloc[-1]):.3f}"
-                    cache["xom"] = f"{float(df['XOM'].iloc[-1]):.2f}"
-                    cache["cvx"] = f"{float(df['CVX'].iloc[-1]):.2f}"
-                    cache["status"] = "OK"
-                    cache["last_fetch"] = time.time()
-            except Exception as e:
-                cache["status"] = "ERROR"
-            
-        time.sleep(5)
+        if cache.get("mode") == "LIVE" and (time.time() - cache["last_fetch"] >= 60):
+            fetch_live_data()
+        time.sleep(2)
 
 threading.Thread(target=update_market_cache, daemon=True).start()
 
@@ -181,7 +184,7 @@ def force_response():
     data = request.get_json() or {}
     if data.get('reset'):
         cache['mode'] = 'LIVE'
-        cache['last_fetch'] = 0  # Triggers immediate refetch
+        fetch_live_data()  # Direct synchronous execution to overwrite cache instantly
     else:
         cache['mode'] = 'FORCED'
         if 'z_score' in data: cache['z_score'] = str(data['z_score'])
