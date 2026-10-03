@@ -1,1 +1,156 @@
+import os
+import time
+import threading
+import logging
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import statsmodels.api as sm
+from flask import Flask, jsonify, render_template_string
+
+app = Flask(__name__)
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
+state = {
+    "capital": 100000.00,
+    "kill_switch_active": False,
+    "mode": "PAPER"
+}
+
+cache = {
+    "last_fetch": 0,
+    "z_score": "0.00",
+    "xom": "0.00",
+    "cvx": "0.00",
+    "status": "OK"
+}
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pairs Trading System</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #121824; color: white; padding: 15px; margin: 0; }
+        .card { background: #1E2638; padding: 15px; border-radius: 10px; margin-bottom: 15px; border: 1px solid #2A3447; }
+        .value { font-size: 28px; font-weight: bold; color: #2979FF; margin-top: 5px; }
+        .btn { width: 100%; padding: 16px; font-size: 16px; font-weight: bold; background: #FF5252; color: white; border: none; border-radius: 8px; cursor: pointer; }
+        .btn:active { transform: scale(0.98); }
+        .status { padding: 12px; border-radius: 6px; font-weight: bold; text-align: center; margin-bottom: 15px; font-size: 14px; letter-spacing: 0.5px; }
+    </style>
+</head>
+<body>
+    <h2 style="text-align:center; font-size: 20px; margin-bottom: 20px;">Candidate B Control Center</h2>
+    
+    <div id="status" class="status" style="background:#00E676; color:black;">SYSTEM ONLINE & ARMED</div>
+    
+    <div class="card">
+        <div style="font-size:12px; color:#8A99AD; font-weight: bold; text-transform: uppercase;">Z-Score (Mean Reversion)</div>
+        <div id="zscore" class="value">Loading...</div>
+    </div>
+    
+    <div class="card">
+        <div style="font-size:12px; color:#8A99AD; font-weight: bold; text-transform: uppercase;">Live Pair Quotes</div>
+        <div id="prices" style="font-size:18px; font-weight:bold; margin-top:5px; color:#FFFFFF;">Loading...</div>
+    </div>
+    
+    <div class="card">
+        <div style="font-size:12px; color:#8A99AD; font-weight: bold; text-transform: uppercase;">Portfolio Capital</div>
+        <div class="value" style="color:#00E676;">$100,000.00</div>
+    </div>
+
+    <button class="btn" onclick="toggleKill()">TOGGLE EMERGENCY KILL SWITCH</button>
+
+    <script>
+        function update() {
+            fetch('/data')
+                .then(res => res.json())
+                .then(d => {
+                    document.getElementById('zscore').innerText = d.z_score;
+                    document.getElementById('prices').innerText = 'XOM: $' + d.xom + '  |  CVX: $' + d.cvx;
+                    let st = document.getElementById('status');
+                    if(d.kill) {
+                        st.innerText = 'HALTED / KILL SWITCH ACTIVE';
+                        st.style.background = '#FF5252';
+                        st.style.color = 'white';
+                    } else {
+                        st.innerText = 'SYSTEM ONLINE & ARMED';
+                        st.style.background = '#00E676';
+                        st.style.color = 'black';
+                    }
+                })
+                .catch(err => {
+                    let st = document.getElementById('status');
+                    st.innerText = 'DISCONNECTED FROM BACKEND';
+                    st.style.background = '#FF9800';
+                    st.style.color = 'black';
+                });
+        }
+
+        function toggleKill() {
+            fetch('/toggle', {method:'POST'})
+                .then(() => update());
+        }
+
+        setInterval(update, 3000);
+        update();
+    </script>
+</body>
+</html>
+"""
+
+def update_market_cache():
+    while True:
+        try:
+            data = yf.download(tickers="XOM CVX", period="5d", interval="1h", progress=False)
+            if 'Close' in data:
+                closes = data['Close']
+            else:
+                closes = data
+                
+            df = closes[['XOM', 'CVX']].dropna()
+
+            if not df.empty:
+                X = sm.add_constant(df['CVX'])
+                model = sm.OLS(df['XOM'], X).fit()
+                beta = model.params['CVX']
+                alpha = model.params['const']
+                
+                spread = df['XOM'] - (beta * df['CVX']) - alpha
+                z = (spread - spread.mean()) / spread.std()
+                
+                cache["z_score"] = f"{float(z.iloc[-1]):.3f}"
+                cache["xom"] = f"{float(df['XOM'].iloc[-1]):.2f}"
+                cache["cvx"] = f"{float(df['CVX'].iloc[-1]):.2f}"
+                cache["status"] = "OK"
+        except Exception as e:
+            cache["status"] = "ERROR"
+            
+        time.sleep(30)
+
+threading.Thread(target=update_market_cache, daemon=True).start()
+
+@app.route('/')
+def home():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/data')
+def get_data():
+    return jsonify({
+        'z_score': cache['z_score'],
+        'xom': cache['xom'],
+        'cvx': cache['cvx'],
+        'kill': state['kill_switch_active']
+    })
+
+@app.route('/toggle', methods=['POST'])
+def toggle():
+    state['kill_switch_active'] = not state['kill_switch_active']
+    return jsonify({'status': 'ok', 'kill_switch_active': state['kill_switch_active']})
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
 
