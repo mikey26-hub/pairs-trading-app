@@ -7,17 +7,29 @@ import numpy as np
 import yfinance as yf
 import statsmodels.api as sm
 from flask import Flask, jsonify, request, render_template_string
+import alpaca_trade_api as tradeapi
 
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
+# Alpaca API Setup (using environment variables)
+ALPACA_KEY = os.environ.get('ALPACA_API_KEY', '')
+ALPACA_SECRET = os.environ.get('ALPACA_SECRET_KEY', '')
+ALPACA_BASE_URL = 'https://paper-api.alpaca.markets'  # Change to live URL for real money
+
+api = None
+if ALPACA_KEY and ALPACA_SECRET:
+    try:
+        api = tradeapi.REST(ALPACA_KEY, ALPACA_SECRET, ALPACA_BASE_URL, api_version='v2')
+    except Exception as e:
+        print(f"Alpaca connection error: {e}")
+
 state = {
     "capital": 100000.00,
     "kill_switch_active": False,
-    "mode": "PAPER"
+    "position": "FLAT"  # "FLAT", "LONG_SPREAD", or "SHORT_SPREAD"
 }
 
-# Pre-populate with realistic weekend market defaults
 cache = {
     "last_fetch": 0,
     "z_score": "0.124",
@@ -61,13 +73,13 @@ HTML_TEMPLATE = """
     </div>
     
     <div class="card">
-        <div style="font-size:12px; color:#8A99AD; font-weight: bold; text-transform: uppercase;">Portfolio Capital</div>
-        <div class="value" style="color:#00E676;">$100,000.00</div>
+        <div style="font-size:12px; color:#8A99AD; font-weight: bold; text-transform: uppercase;">Broker Position State</div>
+        <div id="position" class="value" style="color:#00E676;">FLAT</div>
     </div>
 
     <!-- SYNTHETIC RESPONSE TEST PANEL -->
     <div class="card" style="border-color: #FFD600;">
-        <div style="font-size:12px; color:#FFD600; font-weight: bold; text-transform: uppercase; margin-bottom: 8px;">Force Synthetic Response</div>
+        <div style="font-size:12px; color:#FFD600; font-weight: bold; text-transform: uppercase; margin-bottom: 8px;">Force Synthetic Response & Orders</div>
         <div style="display: flex; gap: 8px;">
             <button class="ctrl-btn" onclick="forceState(2.50, 122.50, 148.10)" style="background:#FF9800; color:black;">Force High (+2.5)</button>
             <button class="ctrl-btn" onclick="forceState(-2.20, 114.00, 156.30)" style="background:#2979FF; color:white;">Force Low (-2.2)</button>
@@ -84,6 +96,7 @@ HTML_TEMPLATE = """
                 .then(d => {
                     document.getElementById('zscore').innerText = d.z_score;
                     document.getElementById('prices').innerText = 'XOM: $' + d.xom + '  |  CVX: $' + d.cvx;
+                    document.getElementById('position').innerText = d.position;
                     let st = document.getElementById('status');
                     if(d.kill) {
                         st.innerText = 'HALTED / KILL SWITCH ACTIVE';
@@ -130,6 +143,32 @@ HTML_TEMPLATE = """
 </html>
 """
 
+def execute_paired_trades(z_val):
+    """Submits market orders to Alpaca when thresholds are crossed."""
+    global api
+    if not api or state["kill_switch_active"]:
+        return
+
+    try:
+        # Sell Spread Condition: Z > 2.0 (Short XOM, Long CVX)
+        if z_val > 2.0 and state["position"] == "FLAT":
+            api.submit_order(symbol='XOM', qty=10, side='sell', type='market', time_in_force='gtc')
+            api.submit_order(symbol='CVX', qty=8, side='buy', type='market', time_in_force='gtc')
+            state["position"] = "SHORT_SPREAD (SHORT XOM / LONG CVX)"
+
+        # Buy Spread Condition: Z < -2.0 (Long XOM, Short CVX)
+        elif z_val < -2.0 and state["position"] == "FLAT":
+            api.submit_order(symbol='XOM', qty=10, side='buy', type='market', time_in_force='gtc')
+            api.submit_order(symbol='CVX', qty=8, side='sell', type='market', time_in_force='gtc')
+            state["position"] = "LONG_SPREAD (LONG XOM / SHORT CVX)"
+
+        # Mean Reversion Close Condition: |Z| < 0.2
+        elif abs(z_val) < 0.2 and state["position"] != "FLAT":
+            api.close_all_positions()
+            state["position"] = "FLAT"
+    except Exception as e:
+        print(f"Execution Error: {e}")
+
 def fetch_live_data():
     try:
         data = yf.download(tickers="XOM CVX", period="1mo", interval="1d", progress=False)
@@ -144,14 +183,16 @@ def fetch_live_data():
             
             spread = df['XOM'] - (beta * df['CVX']) - alpha
             z = (spread - spread.mean()) / spread.std()
+            z_val = float(z.iloc[-1])
             
-            cache["z_score"] = f"{float(z.iloc[-1]):.3f}"
+            cache["z_score"] = f"{z_val:.3f}"
             cache["xom"] = f"{float(df['XOM'].iloc[-1]):.2f}"
             cache["cvx"] = f"{float(df['CVX'].iloc[-1]):.2f}"
             cache["status"] = "OK"
             cache["last_fetch"] = time.time()
+            
+            execute_paired_trades(z_val)
     except Exception as e:
-        # Keep fallback default cache values if yfinance throttles
         pass
 
 def update_market_cache():
@@ -172,6 +213,7 @@ def get_data():
         'z_score': cache['z_score'],
         'xom': cache['xom'],
         'cvx': cache['cvx'],
+        'position': state['position'],
         'kill': state['kill_switch_active']
     })
 
@@ -188,7 +230,9 @@ def force_response():
         fetch_live_data()
     else:
         cache['mode'] = 'FORCED'
-        if 'z_score' in data: cache['z_score'] = str(data['z_score'])
+        if 'z_score' in data: 
+            cache['z_score'] = str(data['z_score'])
+            execute_paired_trades(float(data['z_score']))
         if 'xom' in data: cache['xom'] = str(data['xom'])
         if 'cvx' in data: cache['cvx'] = str(data['cvx'])
         
