@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import statsmodels.api as sm
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, request, render_template_string
 
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
@@ -38,6 +38,8 @@ HTML_TEMPLATE = """
         .value { font-size: 28px; font-weight: bold; color: #2979FF; margin-top: 5px; }
         .btn { width: 100%; padding: 16px; font-size: 16px; font-weight: bold; background: #FF5252; color: white; border: none; border-radius: 8px; cursor: pointer; }
         .btn:active { transform: scale(0.98); }
+        .ctrl-btn { flex: 1; padding: 10px; border: none; font-weight: bold; border-radius: 6px; cursor: pointer; font-size: 13px; }
+        .ctrl-btn:active { opacity: 0.8; }
         .status { padding: 12px; border-radius: 6px; font-weight: bold; text-align: center; margin-bottom: 15px; font-size: 14px; letter-spacing: 0.5px; }
     </style>
 </head>
@@ -59,6 +61,16 @@ HTML_TEMPLATE = """
     <div class="card">
         <div style="font-size:12px; color:#8A99AD; font-weight: bold; text-transform: uppercase;">Portfolio Capital</div>
         <div class="value" style="color:#00E676;">$100,000.00</div>
+    </div>
+
+    <!-- SYNTHETIC RESPONSE TEST PANEL -->
+    <div class="card" style="border-color: #FFD600;">
+        <div style="font-size:12px; color:#FFD600; font-weight: bold; text-transform: uppercase; margin-bottom: 8px;">Force Synthetic Response</div>
+        <div style="display: flex; gap: 8px;">
+            <button class="ctrl-btn" onclick="forceState(2.50, 122.50, 148.10)" style="background:#FF9800; color:black;">Force High (+2.5)</button>
+            <button class="ctrl-btn" onclick="forceState(-2.20, 114.00, 156.30)" style="background:#2979FF; color:white;">Force Low (-2.2)</button>
+            <button class="ctrl-btn" onclick="resetLive()" style="background:#4A5568; color:white;">Reset Live</button>
+        </div>
     </div>
 
     <button class="btn" onclick="toggleKill()">TOGGLE EMERGENCY KILL SWITCH</button>
@@ -90,8 +102,23 @@ HTML_TEMPLATE = """
         }
 
         function toggleKill() {
-            fetch('/toggle', {method:'POST'})
-                .then(() => update());
+            fetch('/toggle', {method:'POST'}).then(() => update());
+        }
+
+        function forceState(z, xom, cvx) {
+            fetch('/force_response', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ z_score: z, xom: xom, cvx: cvx })
+            }).then(() => update());
+        }
+
+        function resetLive() {
+            fetch('/force_response', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ reset: true })
+            }).then(() => update());
         }
 
         setInterval(update, 3000);
@@ -103,32 +130,31 @@ HTML_TEMPLATE = """
 
 def update_market_cache():
     while True:
-        try:
-            data = yf.download(tickers="XOM CVX", period="5d", interval="1h", progress=False)
-            if 'Close' in data:
-                closes = data['Close']
-            else:
-                closes = data
-                
-            df = closes[['XOM', 'CVX']].dropna()
+        # Only fetch live data if reset or not currently forced
+        if time.time() - cache["last_fetch"] >= 30 and cache.get("mode") != "FORCED":
+            try:
+                data = yf.download(tickers="XOM CVX", period="5d", interval="1h", progress=False)
+                closes = data['Close'] if 'Close' in data else data
+                df = closes[['XOM', 'CVX']].dropna()
 
-            if not df.empty:
-                X = sm.add_constant(df['CVX'])
-                model = sm.OLS(df['XOM'], X).fit()
-                beta = model.params['CVX']
-                alpha = model.params['const']
-                
-                spread = df['XOM'] - (beta * df['CVX']) - alpha
-                z = (spread - spread.mean()) / spread.std()
-                
-                cache["z_score"] = f"{float(z.iloc[-1]):.3f}"
-                cache["xom"] = f"{float(df['XOM'].iloc[-1]):.2f}"
-                cache["cvx"] = f"{float(df['CVX'].iloc[-1]):.2f}"
-                cache["status"] = "OK"
-        except Exception as e:
-            cache["status"] = "ERROR"
+                if not df.empty:
+                    X = sm.add_constant(df['CVX'])
+                    model = sm.OLS(df['XOM'], X).fit()
+                    beta = model.params['CVX']
+                    alpha = model.params['const']
+                    
+                    spread = df['XOM'] - (beta * df['CVX']) - alpha
+                    z = (spread - spread.mean()) / spread.std()
+                    
+                    cache["z_score"] = f"{float(z.iloc[-1]):.3f}"
+                    cache["xom"] = f"{float(df['XOM'].iloc[-1]):.2f}"
+                    cache["cvx"] = f"{float(df['CVX'].iloc[-1]):.2f}"
+                    cache["status"] = "OK"
+                    cache["last_fetch"] = time.time()
+            except Exception as e:
+                cache["status"] = "ERROR"
             
-        time.sleep(30)
+        time.sleep(5)
 
 threading.Thread(target=update_market_cache, daemon=True).start()
 
@@ -150,7 +176,20 @@ def toggle():
     state['kill_switch_active'] = not state['kill_switch_active']
     return jsonify({'status': 'ok', 'kill_switch_active': state['kill_switch_active']})
 
+@app.route('/force_response', methods=['POST'])
+def force_response():
+    data = request.get_json() or {}
+    if data.get('reset'):
+        cache['mode'] = 'LIVE'
+        cache['last_fetch'] = 0  # Triggers immediate refetch
+    else:
+        cache['mode'] = 'FORCED'
+        if 'z_score' in data: cache['z_score'] = str(data['z_score'])
+        if 'xom' in data: cache['xom'] = str(data['xom'])
+        if 'cvx' in data: cache['cvx'] = str(data['cvx'])
+        
+    return jsonify({'status': 'ok', 'cache': cache})
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-
