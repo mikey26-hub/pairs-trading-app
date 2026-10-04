@@ -7,27 +7,28 @@ import numpy as np
 import yfinance as yf
 import statsmodels.api as sm
 from flask import Flask, jsonify, request, render_template_string
-import alpaca_trade_api as tradeapi
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-# Alpaca API Setup (using environment variables)
+# Alpaca API Setup
 ALPACA_KEY = os.environ.get('ALPACA_API_KEY', '')
 ALPACA_SECRET = os.environ.get('ALPACA_SECRET_KEY', '')
-ALPACA_BASE_URL = 'https://paper-api.alpaca.markets'  # Change to live URL for real money
 
-api = None
+trading_client = None
 if ALPACA_KEY and ALPACA_SECRET:
     try:
-        api = tradeapi.REST(ALPACA_KEY, ALPACA_SECRET, ALPACA_BASE_URL, api_version='v2')
+        trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
     except Exception as e:
         print(f"Alpaca connection error: {e}")
 
 state = {
     "capital": 100000.00,
     "kill_switch_active": False,
-    "position": "FLAT"  # "FLAT", "LONG_SPREAD", or "SHORT_SPREAD"
+    "position": "FLAT"
 }
 
 cache = {
@@ -145,26 +146,30 @@ HTML_TEMPLATE = """
 
 def execute_paired_trades(z_val):
     """Submits market orders to Alpaca when thresholds are crossed."""
-    global api
-    if not api or state["kill_switch_active"]:
+    global trading_client
+    if not trading_client or state["kill_switch_active"]:
         return
 
     try:
         # Sell Spread Condition: Z > 2.0 (Short XOM, Long CVX)
         if z_val > 2.0 and state["position"] == "FLAT":
-            api.submit_order(symbol='XOM', qty=10, side='sell', type='market', time_in_force='gtc')
-            api.submit_order(symbol='CVX', qty=8, side='buy', type='market', time_in_force='gtc')
+            req_xom = MarketOrderRequest(symbol="XOM", qty=10, side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
+            req_cvx = MarketOrderRequest(symbol="CVX", qty=8, side=OrderSide.BUY, time_in_force=TimeInForce.GTC)
+            trading_client.submit_order(req_xom)
+            trading_client.submit_order(req_cvx)
             state["position"] = "SHORT_SPREAD (SHORT XOM / LONG CVX)"
 
         # Buy Spread Condition: Z < -2.0 (Long XOM, Short CVX)
         elif z_val < -2.0 and state["position"] == "FLAT":
-            api.submit_order(symbol='XOM', qty=10, side='buy', type='market', time_in_force='gtc')
-            api.submit_order(symbol='CVX', qty=8, side='sell', type='market', time_in_force='gtc')
+            req_xom = MarketOrderRequest(symbol="XOM", qty=10, side=OrderSide.BUY, time_in_force=TimeInForce.GTC)
+            req_cvx = MarketOrderRequest(symbol="CVX", qty=8, side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
+            trading_client.submit_order(req_xom)
+            trading_client.submit_order(req_cvx)
             state["position"] = "LONG_SPREAD (LONG XOM / SHORT CVX)"
 
         # Mean Reversion Close Condition: |Z| < 0.2
         elif abs(z_val) < 0.2 and state["position"] != "FLAT":
-            api.close_all_positions()
+            trading_client.close_all_positions(cancel_orders=True)
             state["position"] = "FLAT"
     except Exception as e:
         print(f"Execution Error: {e}")
